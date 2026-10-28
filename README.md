@@ -87,6 +87,8 @@ export PKG_CONFIG_PATH=<neko install>/lib/pkgconfig:$PKG_CONFIG_PATH   # the Nek
 
 The files are copies of the committed sources, with two changes:
 - `rs_phmg/rs_line_hip.cpp` defines `cudaMalloc`/`cudaFree` for the HIP build (see `rs_phmg/README.md`);
-- `cgmrs/rs_cgmrs.f90` computes the smoothed residual norm directly instead of by a recurrence that stopped solves early (see `cgmrs/README.md`). The method write-ups are in the projects' logbooks and briefs:
+- `cgmrs/rs_cgmrs.f90` computes the smoothed residual norm directly instead of by a recurrence that stopped solves early (see `cgmrs/README.md`).
+
+The method write-ups are in the projects' logbooks and briefs:
 - `box_solvers`: briefs 3-6, logbooks 2026-10-12 to 2026-10-28;
 - `robust_solvers`: brief 6 and the technical report of 2026-10-14.
