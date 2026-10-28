@@ -1,0 +1,698 @@
+! tamgx_smoother: tree-AMG smoothers with optional Jacobi scaling
+! Derived from Neko (develop 77243ce, BSD-3-Clause, the Neko authors) with the
+! user's patch neko_phmg_exact_diag_develop-6a661f1 (Jacobi-scaled tree-AMG
+! Chebyshev with an exact coarse diagonal, deeper hierarchy): the phmg part of
+! the patch as a user type (registered as "phmgx"), modules renamed so that it
+! lives next to Neko's own phmg. The GMRES-restart part of the patch is left out.
+! Source: references/neko_phmg_patch/ (patch, README, phmg_study/REPORT.md).
+! Copyright (c) 2024-2026, The Neko Authors
+! All rights reserved.
+!
+! Redistribution and use in source and binary forms, with or without
+! modification, are permitted provided that the following conditions
+! are met:
+!
+!   * Redistributions of source code must retain the above copyright
+!     notice, this list of conditions and the following disclaimer.
+!
+!   * Redistributions in binary form must reproduce the above
+!     copyright notice, this list of conditions and the following
+!     disclaimer in the documentation and/or other materials provided
+!     with the distribution.
+!
+!   * Neither the name of the authors nor the names of its
+!     contributors may be used to endorse or promote products derived
+!     from this software without specific prior written permission.
+!
+! THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+! "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+! LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+! FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+! COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+! INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+! BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+! LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+! CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+! LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+! ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+! POSSIBILITY OF SUCH DAMAGE.
+!
+!> Implements smoothers for use with TreeAMG matrix vector product
+module tamgx_smoother
+  use tree_amg, only : tamg_hierarchy_t
+  use tree_amg_utils, only : tamg_sample_matrix_val
+  use num_types, only : rp
+  use math, only : col2, col3, invcol1, add2, add2s2, glsc2, glsc3, sub2, cmult, &
+       cmult2, copy, add3s2
+  use device_math, only : device_glsc2, device_glsc3, device_rzero, &
+       device_cmult2, device_sub2, device_add2, device_add3s2, &
+       device_copy, device_col2, device_col3, device_invcol1
+  use krylov, only : ksp_monitor_t
+  use scalar_bc_projector, only : scalar_bc_projector_t
+  use gather_scatter, only : gs_t, GS_OP_ADD
+  use logger, only : neko_log, LOG_SIZE
+  use profiler, only : profiler_start_region, profiler_end_region
+  use device, only: device_map, device_unmap, device_memcpy, HOST_TO_DEVICE
+  use device_tree_amg_smoother, only : amg_device_cheby_solve_part1, &
+       amg_device_cheby_solve_part2
+  use neko_config, only : NEKO_BCKND_DEVICE
+  use, intrinsic :: iso_c_binding
+  implicit none
+  private
+
+  !> Type for Chebyshev iteration using TreeAMG matvec
+  type, public :: amg_jacobi_t
+     real(kind=rp), allocatable :: d(:)
+     real(kind=rp), allocatable :: w(:)
+     real(kind=rp), allocatable :: r(:)
+     real(kind=rp) :: omega
+     integer :: lvl
+     integer :: n
+     integer :: max_iter = 10
+     logical :: recompute_diag = .true.
+   contains
+     procedure, pass(this) :: init => amg_jacobi_init
+     procedure, pass(this) :: solve => amg_jacobi_solve
+     procedure, pass(this) :: comp_diag => amg_jacobi_diag
+     procedure, pass(this) :: free => amg_jacobi_free
+  end type amg_jacobi_t
+
+  !> Type for Chebyshev iteration using TreeAMG matvec
+  type, public :: amg_cheby_t
+     real(kind=rp), allocatable :: d(:)
+     type(c_ptr) :: d_d = C_NULL_PTR
+     real(kind=rp), allocatable :: w(:)
+     type(c_ptr) :: w_d = C_NULL_PTR
+     real(kind=rp), allocatable :: r(:)
+     type(c_ptr) :: r_d = C_NULL_PTR
+     !> Saved eigenvector, to restart the power method after a small
+     !> operator change. Allocated only if warm_start_eigs.
+     real(kind=rp), allocatable :: ev(:)
+     type(c_ptr) :: ev_d = C_NULL_PTR
+     real(kind=rp) :: tha, dlt
+     integer :: lvl
+     integer :: n
+     integer :: power_its = 250
+     !> Iterations to use when restarting from ev
+     integer :: power_its_refresh = 20
+     !> Restart the power method from ev instead of a random vector
+     logical :: warm_start_eigs = .false.
+     !> Whether ev holds a usable eigenvector yet
+     logical :: eigs_computed = .false.
+     integer :: max_iter = 10
+     logical :: recompute_eigs = .true.
+     !> Jacobi (diagonal) scaling of the level operator. When set, the
+     !> Chebyshev iteration runs on D^{-1} A instead of A, so that regions
+     !> with very different element sizes are smoothed alike.
+     logical :: use_jacobi = .false.
+     real(kind=rp), allocatable :: dinv(:)
+     type(c_ptr) :: dinv_d = C_NULL_PTR
+     real(kind=rp), allocatable :: ft(:)
+     type(c_ptr) :: ft_d = C_NULL_PTR
+   contains
+     procedure, pass(this) :: init => amg_cheby_init
+     procedure, pass(this) :: set_jacobi => amg_cheby_set_jacobi
+     procedure, pass(this) :: set_jacobi_d => amg_cheby_set_jacobi_d
+     procedure, pass(this) :: solve => amg_cheby_solve
+     procedure, pass(this) :: comp_eig => amg_cheby_power
+     procedure, pass(this) :: device_solve => amg_device_cheby_solve
+     procedure, pass(this) :: device_comp_eig => amg_device_cheby_power
+     procedure, pass(this) :: free => amg_cheby_free
+  end type amg_cheby_t
+
+contains
+
+  !> Initialization of chebyshev
+  !! @param n Number of dofs
+  !! @param lvl The tamg hierarchy level on which the iterations are
+  !! to be applied
+  !! @param max_iter The number of iterations (chebyshev degree)
+  subroutine amg_cheby_init(this, n, lvl, max_iter)
+    class(amg_cheby_t), intent(inout), target :: this
+    integer, intent(in) :: n
+    integer, intent(in) :: lvl
+    integer, intent(in) :: max_iter
+
+    allocate(this%d(n))
+    allocate(this%w(n))
+    allocate(this%r(n))
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_map(this%d, this%d_d, n)
+       call device_map(this%w, this%w_d, n)
+       call device_map(this%r, this%r_d, n)
+    end if
+    this%n = n
+    this%lvl = lvl
+    this%max_iter = max_iter
+    this%recompute_eigs = .true.
+
+    call amg_smoo_monitor(lvl, this)
+
+  end subroutine amg_cheby_init
+
+  !> free cheby data
+  subroutine amg_cheby_free(this)
+    class(amg_cheby_t), intent(inout), target :: this
+    if (allocated(this%d)) then
+       if (NEKO_BCKND_DEVICE .eq. 1 .and. c_associated(this%d_d)) then
+          call device_unmap(this%d, this%d_d)
+       end if
+       deallocate(this%d)
+    end if
+    if (allocated(this%w)) then
+       if (NEKO_BCKND_DEVICE .eq. 1 .and. c_associated(this%w_d)) then
+          call device_unmap(this%w, this%w_d)
+       end if
+       deallocate(this%w)
+    end if
+    if (allocated(this%r)) then
+       if (NEKO_BCKND_DEVICE .eq. 1 .and. c_associated(this%r_d)) then
+          call device_unmap(this%r, this%r_d)
+       end if
+       deallocate(this%r)
+    end if
+    if (allocated(this%ev)) then
+       if (NEKO_BCKND_DEVICE .eq. 1 .and. c_associated(this%ev_d)) then
+          call device_unmap(this%ev, this%ev_d)
+       end if
+       deallocate(this%ev)
+    end if
+    if (allocated(this%dinv)) then
+       if (c_associated(this%dinv_d)) call device_unmap(this%dinv, this%dinv_d)
+       deallocate(this%dinv)
+    end if
+    if (allocated(this%ft)) then
+       if (c_associated(this%ft_d)) call device_unmap(this%ft, this%ft_d)
+       deallocate(this%ft)
+    end if
+  end subroutine amg_cheby_free
+
+
+  !> Power method to approximate largest eigenvalue
+  !! @param amg TreeAMG object
+  !! @param n Number of dofs
+  subroutine amg_cheby_power(this, amg, n)
+    class(amg_cheby_t), intent(inout) :: this
+    type(tamg_hierarchy_t), intent(inout) :: amg
+    integer, intent(in) :: n
+    real(kind=rp) :: lam, b, a, rn
+    real(kind=rp), parameter :: boost = 1.1_rp
+    real(kind=rp), parameter :: lam_factor = 30.0_rp
+    real(kind=rp) :: wtw, dtw, dtd
+    integer, allocatable :: fixed_seed(:), saved_seed(:)
+    integer :: i, rnd_n, its
+    logical :: warm
+
+    call profiler_start_region('AMG_cheby_power')
+    warm = this%warm_start_eigs .and. this%eigs_computed .and. &
+         allocated(this%ev)
+    associate(w => this%w, d => this%d, coef => amg%coef, gs_h => amg%gs_h, &
+         msh => amg%msh, Xh => amg%Xh, bc_projector => amg%bc_projector)
+
+      if (warm) then
+         its = this%power_its_refresh
+         call copy(d, this%ev, n)
+      else
+         its = this%power_its
+
+         ! Save current random seed and set a fixed seed
+         call random_seed(size = rnd_n)
+         allocate(saved_seed(rnd_n))
+         allocate(fixed_seed(rnd_n))
+         fixed_seed = 3901
+         call random_seed(get = saved_seed)
+         call random_seed(put = fixed_seed)
+
+         do i = 1, n
+            call random_number(rn)
+            d(i) = rn + 10.0_rp
+         end do
+
+         ! Restore saved random seed
+         call random_seed(put = saved_seed)
+
+         if (this%lvl .eq. 0) then
+            call gs_h%op(d, n, GS_OP_ADD)!TODO
+            call bc_projector%apply(d, n)
+         end if
+      end if
+      !Power method to get lamba max
+      do i = 1, its
+         call amg%matvec(w, d, this%lvl)
+         if (this%use_jacobi) call col2(w, this%dinv, n)
+
+         if (this%lvl .eq. 0) then
+            wtw = glsc3(w, coef%mult, w, n)
+         else
+            wtw = glsc2(w, w, n)
+         end if
+
+         call cmult2(d, w, 1.0_rp/sqrt(wtw), n)
+      end do
+
+      call amg%matvec(w, d, this%lvl)
+         if (this%use_jacobi) call col2(w, this%dinv, n)
+
+      if (this%lvl .eq. 0) then
+         dtw = glsc3(d, coef%mult, w, n)
+         dtd = glsc3(d, coef%mult, d, n)
+      else
+         dtw = glsc2(d, w, n)
+         dtd = glsc2(d, d, n)
+      end if
+      lam = dtw / dtd
+      b = lam * boost
+      a = lam / lam_factor
+      this%tha = (b+a)/2.0_rp
+      this%dlt = (b-a)/2.0_rp
+
+      if (this%warm_start_eigs) then
+         if (.not. allocated(this%ev)) then
+            allocate(this%ev(this%n))
+         end if
+         call copy(this%ev, d, n)
+      end if
+      this%eigs_computed = .true.
+
+      this%recompute_eigs = .false.
+      call amg_cheby_monitor(this%lvl, lam)
+    end associate
+    call profiler_end_region('AMG_cheby_power')
+  end subroutine amg_cheby_power
+
+  !> Chebyshev smoother
+  !> From Saad's iterative methods textbook
+  !! @param x The solution to be returned
+  !! @param f The right-hand side
+  !! @param n Number of dofs
+  !! @param amg The TreeAMG object
+  subroutine amg_cheby_solve(this, x, f, n, amg, zero_init)
+    class(amg_cheby_t), intent(inout) :: this
+    integer, intent(in) :: n
+    real(kind=rp), dimension(n), intent(inout) :: x
+    real(kind=rp), dimension(n), intent(inout) :: f
+    class(tamg_hierarchy_t), intent(inout) :: amg
+    type(ksp_monitor_t) :: ksp_results
+    logical, optional, intent(in) :: zero_init
+    integer :: iter, max_iter, i
+    real(kind=rp) :: rtr, rnorm
+    real(kind=rp) :: rhok, rhokp1, s1, thet, delt, tmp1, tmp2
+    logical :: zero_initial_guess
+
+    if (this%recompute_eigs) then
+       call this%comp_eig(amg, n)
+    end if
+    if (present(zero_init)) then
+       zero_initial_guess = zero_init
+    else
+       zero_initial_guess = .false.
+    end if
+    max_iter = this%max_iter
+
+    associate(w => this%w, r => this%r, d => this%d, &
+         bc_projector => amg%bc_projector)
+      if (this%use_jacobi) then
+         call col3(r, f, this%dinv, n)
+      else
+         call copy(r, f, n)
+      end if
+      if (.not. zero_initial_guess) then
+         call amg%matvec(w, x, this%lvl)
+         if (this%use_jacobi) call col2(w, this%dinv, n)
+         call sub2(r, w, n)
+      end if
+
+      thet = this%tha
+      delt = this%dlt
+      s1 = thet / delt
+      rhok = 1.0_rp / s1
+
+      ! First iteration
+      !OCL NORECURRENCE, NOVREC, NOALIAS
+      !DIR$ CONCURRENT
+      !DIR$ IVDEP
+      !GCC$ ivdep
+      !$omp parallel do
+      do i = 1, n
+         d(i) = 1.0_rp/thet * r(i)
+         x(i) = x(i) + d(i)
+      end do
+      !$omp end parallel do
+
+      ! Rest of iterations
+      do iter = 2, max_iter
+         call amg%matvec(w, d, this%lvl)
+         if (this%use_jacobi) call col2(w, this%dinv, n)
+
+         rhokp1 = 1.0_rp / (2.0_rp * s1 - rhok)
+         tmp1 = rhokp1 * rhok
+         tmp2 = 2.0_rp * rhokp1 / delt
+         rhok = rhokp1
+
+         !$omp parallel private(i)
+         !OCL NORECURRENCE, NOVREC, NOALIAS
+         !DIR$ CONCURRENT
+         !DIR$ IVDEP
+         !GCC$ ivdep
+         !$omp do
+         do i = 1, n
+            r(i) = r(i) - w(i)
+            d(i) = tmp1 * d(i) + tmp2 * r(i)
+            x(i) = x(i) + d(i)
+         end do
+         !$omp end do
+         !$omp end parallel
+      end do
+    end associate
+  end subroutine amg_cheby_solve
+
+  !> Power method to approximate largest eigenvalue
+  !! @param amg TreeAMG object
+  !! @param n Number of dofs
+  subroutine amg_device_cheby_power(this, amg, n)
+    class(amg_cheby_t), intent(inout) :: this
+    type(tamg_hierarchy_t), intent(inout) :: amg
+    integer, intent(in) :: n
+    real(kind=rp) :: lam, b, a, rn
+    real(kind=rp), parameter :: boost = 1.1_rp
+    real(kind=rp), parameter :: lam_factor = 30.0_rp
+    real(kind=rp) :: wtw, dtw, dtd
+    integer, allocatable :: fixed_seed(:), saved_seed(:)
+    integer :: i, rnd_n, its
+    logical :: warm
+
+    call profiler_start_region('AMG_cheby_power')
+    warm = this%warm_start_eigs .and. this%eigs_computed .and. &
+         c_associated(this%ev_d)
+    associate(w => this%w, d => this%d, coef => amg%coef, gs_h => amg%gs_h, &
+         msh => amg%msh, Xh => amg%Xh, bc_projector => amg%bc_projector)
+
+      if (warm) then
+         its = this%power_its_refresh
+         call device_copy(this%d_d, this%ev_d, n)
+      else
+         its = this%power_its
+
+         ! Save current random seed and set a fixed seed
+         call random_seed(size = rnd_n)
+         allocate(saved_seed(rnd_n))
+         allocate(fixed_seed(rnd_n))
+         fixed_seed = 3901
+         call random_seed(get = saved_seed)
+         call random_seed(put = fixed_seed)
+
+         do i = 1, n
+            call random_number(rn)
+            d(i) = rn + 10.0_rp
+         end do
+         call device_memcpy(this%d, this%d_d, n, HOST_TO_DEVICE, .true.)
+
+         ! Restore saved random seed
+         call random_seed(put = saved_seed)
+
+         if (this%lvl .eq. 0) then
+            call gs_h%op(d, n, GS_OP_ADD)!TODO
+            call bc_projector%apply(d, n)
+         end if
+      end if
+      do i = 1, its
+         call amg%device_matvec(w, d, this%w_d, this%d_d, this%lvl)
+         if (this%use_jacobi) call device_col2(this%w_d, this%dinv_d, n)
+
+         if (this%lvl .eq. 0) then
+            wtw = device_glsc3(this%w_d, coef%mult_d, this%w_d, n)
+         else
+            wtw = device_glsc2(this%w_d, this%w_d, n)
+         end if
+
+         call device_cmult2(this%d_d, this%w_d, 1.0_rp/sqrt(wtw), n)
+      end do
+
+      call amg%device_matvec(w, d, this%w_d, this%d_d, this%lvl)
+         if (this%use_jacobi) call device_col2(this%w_d, this%dinv_d, n)
+
+      if (this%lvl .eq. 0) then
+         dtw = device_glsc3(this%d_d, coef%mult_d, this%w_d, n)
+         dtd = device_glsc3(this%d_d, coef%mult_d, this%d_d, n)
+      else
+         dtw = device_glsc2(this%d_d, this%w_d, n)
+         dtd = device_glsc2(this%d_d, this%d_d, n)
+      end if
+      lam = dtw / dtd
+      b = lam * boost
+      a = lam / lam_factor
+      this%tha = (b+a)/2.0_rp
+      this%dlt = (b-a)/2.0_rp
+
+      if (this%warm_start_eigs) then
+         if (.not. c_associated(this%ev_d)) then
+            allocate(this%ev(this%n))
+            call device_map(this%ev, this%ev_d, this%n)
+         end if
+         call device_copy(this%ev_d, this%d_d, n)
+      end if
+      this%eigs_computed = .true.
+
+      this%recompute_eigs = .false.
+      call amg_cheby_monitor(this%lvl, lam)
+    end associate
+    call profiler_end_region('AMG_cheby_power')
+  end subroutine amg_device_cheby_power
+
+  !> Chebyshev smoother
+  !> From Saad's iterative methods textbook
+  !! @param x The solution to be returned
+  !! @param f The right-hand side
+  !! @param n Number of dofs
+  !! @param amg The TreeAMG object
+  subroutine amg_device_cheby_solve(this, x, f, x_d, f_d, n, amg, zero_init)
+    class(amg_cheby_t), intent(inout) :: this
+    integer, intent(in) :: n
+    real(kind=rp), dimension(n), intent(inout) :: x
+    real(kind=rp), dimension(n), intent(inout) :: f
+    type(c_ptr) :: x_d
+    type(c_ptr) :: f_d
+    class(tamg_hierarchy_t), intent(inout) :: amg
+    type(ksp_monitor_t) :: ksp_results
+    logical, optional, intent(in) :: zero_init
+    integer :: iter, max_iter
+    real(kind=rp) :: rtr, rnorm
+    real(kind=rp) :: rhok, rhokp1, s1, thet, delt, tmp1, tmp2
+    logical :: zero_initial_guess
+    type(c_ptr) :: fp_d
+
+    if (this%recompute_eigs) then
+       call this%device_comp_eig(amg, n)
+    end if
+    if (present(zero_init)) then
+       zero_initial_guess = zero_init
+    else
+       zero_initial_guess = .false.
+    end if
+    max_iter = this%max_iter
+
+    associate( w_d => this%w_d, r_d => this%r_d, d_d => this%d_d )
+
+      if (this%use_jacobi) then
+         call device_col3(this%ft_d, f_d, this%dinv_d, n)
+         fp_d = this%ft_d
+      else
+         fp_d = f_d
+      end if
+      if (.not. zero_initial_guess) then
+         call amg%device_matvec(this%w, x, w_d, x_d, this%lvl)
+         if (this%use_jacobi) call device_col2(w_d, this%dinv_d, n)
+      end if
+
+      thet = this%tha
+      delt = this%dlt
+      s1 = thet / delt
+      rhok = 1.0_rp / s1
+
+      ! First iteration
+      tmp1 = 1.0_rp / thet
+      call amg_device_cheby_solve_part1(r_d, fp_d, w_d, x_d, d_d, &
+           tmp1, n, zero_initial_guess)
+      ! Rest of iterations
+      do iter = 2, max_iter
+         call amg%device_matvec(this%w, this%d, w_d, d_d, this%lvl)
+         if (this%use_jacobi) call device_col2(w_d, this%dinv_d, n)
+
+         rhokp1 = 1.0_rp / (2.0_rp * s1 - rhok)
+         tmp1 = rhokp1 * rhok
+         tmp2 = 2.0_rp * rhokp1 / delt
+         rhok = rhokp1
+
+         call amg_device_cheby_solve_part2(r_d, w_d, d_d, x_d, tmp1, tmp2, n)
+
+      end do
+    end associate
+  end subroutine amg_device_cheby_solve
+
+  !> Enable Jacobi scaling of the Chebyshev iteration (host data).
+  !! @param diag The diagonal of the level operator
+  !! @param n Number of dofs
+  subroutine amg_cheby_set_jacobi(this, diag, n)
+    class(amg_cheby_t), intent(inout) :: this
+    integer, intent(in) :: n
+    real(kind=rp), intent(in) :: diag(n)
+    integer :: i
+    if (.not. allocated(this%dinv)) allocate(this%dinv(n))
+    do i = 1, n
+       this%dinv(i) = 1.0_rp / diag(i)
+    end do
+    this%use_jacobi = .true.
+    this%recompute_eigs = .true.
+  end subroutine amg_cheby_set_jacobi
+
+  !> Enable Jacobi scaling of the Chebyshev iteration (device data).
+  !! @param diag_d Device pointer to the diagonal of the level operator
+  !! @param n Number of dofs
+  subroutine amg_cheby_set_jacobi_d(this, diag_d, n)
+    class(amg_cheby_t), intent(inout) :: this
+    type(c_ptr), intent(in) :: diag_d
+    integer, intent(in) :: n
+    if (.not. allocated(this%dinv)) then
+       allocate(this%dinv(n))
+       call device_map(this%dinv, this%dinv_d, n)
+    end if
+    if (.not. allocated(this%ft)) then
+       allocate(this%ft(n))
+       call device_map(this%ft, this%ft_d, n)
+    end if
+    call device_copy(this%dinv_d, diag_d, n)
+    call device_invcol1(this%dinv_d, n)
+    this%use_jacobi = .true.
+    this%recompute_eigs = .true.
+  end subroutine amg_cheby_set_jacobi_d
+
+  !> Initialization of Jacobi (this is expensive...)
+  !! @param n Number of dofs
+  !! @param lvl The tamg hierarchy level on which the iterations are
+  !! to be applied
+  !! @param max_iter The number of iterations
+  subroutine amg_jacobi_init(this, n, lvl, max_iter)
+    class(amg_jacobi_t), intent(inout), target :: this
+    integer, intent(in) :: n
+    integer, intent(in) :: lvl
+    integer, intent(in) :: max_iter
+
+    allocate(this%d(n))
+    allocate(this%w(n))
+    allocate(this%r(n))
+    this%n = n
+    this%lvl = lvl
+    this%max_iter = max_iter
+    this%omega = 0.7_rp
+
+  end subroutine amg_jacobi_init
+
+  !> free jacobi data
+  subroutine amg_jacobi_free(this)
+    class(amg_jacobi_t), intent(inout), target :: this
+    if (allocated(this%d)) then
+       deallocate(this%d)
+    end if
+    if (allocated(this%w)) then
+       deallocate(this%w)
+    end if
+    if (allocated(this%r)) then
+       deallocate(this%r)
+    end if
+  end subroutine amg_jacobi_free
+
+  !> SAMPLE MATRIX DIAGONAL VALUES (DO NOT USE, EXPENSIVE)
+  !! @param amg TreeAMG object
+  !! @param n Number of dofs
+  subroutine amg_jacobi_diag(this, amg, n)
+    class(amg_jacobi_t), intent(inout) :: this
+    type(tamg_hierarchy_t), intent(inout) :: amg
+    integer, intent(in) :: n
+    real(kind=rp) :: val
+    integer :: i
+    do i = 1, n
+       call tamg_sample_matrix_val(val, amg, this%lvl, i, i)
+       this%d(i) = 1.0_rp / val
+    end do
+    this%recompute_diag = .false.
+  end subroutine amg_jacobi_diag
+
+  !> Jacobi smoother
+  !! @param x The solution to be returned
+  !! @param f The right-hand side
+  !! @param n Number of dofs
+  !! @param amg The TreeAMG object
+  subroutine amg_jacobi_solve(this, x, f, n, amg, niter)
+    class(amg_jacobi_t), intent(inout) :: this
+    integer, intent(in) :: n
+    real(kind=rp), dimension(n), intent(inout) :: x
+    real(kind=rp), dimension(n), intent(inout) :: f
+    class(tamg_hierarchy_t), intent(inout) :: amg
+    type(ksp_monitor_t) :: ksp_results
+    integer, optional, intent(in) :: niter
+    integer :: iter, max_iter
+    real(kind=rp) :: rtr, rnorm
+    integer :: i
+
+    if (this%recompute_diag) then
+       call this%comp_diag(amg, n)
+    end if
+
+    if (present(niter)) then
+       max_iter = niter
+    else
+       max_iter = this%max_iter
+    end if
+
+    ! x = x + omega * Dinv( f - Ax )
+    associate( w => this%w, r => this%r, d => this%d)
+      do iter = 1, max_iter
+         w = 0.0_rp
+         !> w = A x
+         call amg%matvec(w, x, this%lvl)
+         !$omp parallel private(i)
+         !> r = f - Ax
+         !$omp do
+         do i = 1, n
+            r(i) = f(i) - w(i)
+         end do
+         !$omp end do
+         !> r = Dinv * (f - Ax)
+         !$omp do
+         do i = 1, n
+            r(i) = r(i) * d(i)
+         end do
+         !$omp end do
+         !> x = x + omega * Dinv * (f - Ax)
+         !$omp do
+         do i = 1, n
+            x(i) = x(i) + this%omega * r(i)
+         end do
+         !$omp end do
+         !$omp end parallel
+      end do
+    end associate
+  end subroutine amg_jacobi_solve
+
+  subroutine amg_smoo_monitor(lvl, smoo)
+    integer, intent(in) :: lvl
+    class(amg_cheby_t), intent(in) :: smoo
+    character(len=LOG_SIZE) :: log_buf
+
+    write(log_buf, '(A8,I2,A28)') '-- level', lvl, '-- init smoother: Chebyshev'
+    call neko_log%message(log_buf)
+    write(log_buf, '(A22,I6)') 'Iterations:', smoo%max_iter
+    call neko_log%message(log_buf)
+  end subroutine amg_smoo_monitor
+
+  subroutine amg_cheby_monitor(lvl, lam)
+    integer, intent(in) :: lvl
+    real(kind=rp), intent(in) :: lam
+    character(len=LOG_SIZE) :: log_buf
+
+    write(log_buf, '(A12,I2,A29,F12.3)') '-- AMG level', lvl, &
+         '-- Chebyshev approx. max eig', lam
+    call neko_log%message(log_buf)
+  end subroutine amg_cheby_monitor
+
+end module tamgx_smoother

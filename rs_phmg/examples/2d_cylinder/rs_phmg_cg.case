@@ -1,0 +1,94 @@
+{
+  "version": 1.0,
+  "case": {
+    "mesh_file": "2d_cylinder.nmsh",
+    "output_boundary": false,
+    "output_checkpoints": false,
+    "output_at_end": false,
+    "time": {
+      "end_time": 0.25,
+      "variable_timestep": true,
+      "max_timestep": 0.0025,
+      "target_cfl": 0.3
+    },
+    "numerics": {
+      "time_order": 3,
+      "polynomial_order": 7,
+      "dealias": true
+    },
+    "fluid": {
+      "scheme": "pnpn",
+      "Re": 160.0,
+      "initial_condition": {
+        "type": "uniform",
+        "value": [
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      "velocity_solver": {
+        "type": "cg",
+        "preconditioner": {
+          "type": "jacobi"
+        },
+        "projection_space_size": 0,
+        "absolute_tolerance": 1e-07,
+        "max_iterations": 800
+      },
+      "pressure_solver": {
+        "type": "cg",
+        "preconditioner": {
+          "type": "rs_phmg",
+          "pcoarsening_schedule": [
+            3,
+            1
+          ],
+          "smoother_iterations": 3,
+          "coarse_grid": {
+            "levels": 3,
+            "iterations": 1,
+            "cheby_degree": 4
+          },
+          "smoother_cheby_acc": "line",
+          "line_columns": true,
+          "coarse_solver": "colagg",
+          "colagg_cycles": 1,
+          "colagg_hierarchy": true,
+          "colagg_crs_host": true,
+          "colagg_dense_max": 0,
+          "colagg_direct": true
+        },
+        "projection_space_size": 0,
+        "absolute_tolerance": 1e-07,
+        "max_iterations": 250
+      },
+      "boundary_conditions": [
+        {
+          "type": "no_slip",
+          "zone_indices": [
+            2
+          ]
+        },
+        {
+          "type": "velocity_value",
+          "zone_indices": [
+            3
+          ],
+          "value": [
+            1.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "type": "outflow",
+          "zone_indices": [
+            4
+          ]
+        }
+      ],
+      "output_control": "never"
+    }
+  }
+}

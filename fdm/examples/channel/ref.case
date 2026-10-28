@@ -1,0 +1,112 @@
+{
+ "version": 1.0,
+ "case": {
+  "mesh_file": "box.nmsh",
+  "output_at_end": false,
+  "output_boundary": false,
+  "output_checkpoints": false,
+  "time": {
+   "end_time": 0.04,
+   "timestep": 0.002,
+   "variable_timestep": false
+  },
+  "numerics": {
+   "time_order": 3,
+   "polynomial_order": 5,
+   "dealias": true
+  },
+  "fluid": {
+   "scheme": "pnpn",
+   "Re": 100.0,
+   "initial_condition": {
+    "type": "expression",
+    "value": [
+     "1.5*y*(2 - y) + 0.05*y*(2 - y)*sin(x)*cos(2*z)",
+     "0.05*(y*(2 - y))^2*cos(x)*sin(z)",
+     "0.03*y*(2 - y)*sin(z)*cos(x)"
+    ]
+   },
+   "velocity_solver": {
+    "type": "cg",
+    "preconditioner": {
+     "type": "jacobi"
+    },
+    "projection_space_size": 0,
+    "absolute_tolerance": 1e-12,
+    "max_iterations": 2000
+   },
+   "pressure_solver": {
+    "type": "gmres",
+    "preconditioner": {
+     "type": "hsmg"
+    },
+    "projection_space_size": 0,
+    "absolute_tolerance": 1e-11,
+    "max_iterations": 2000
+   },
+   "flow_rate_force": {
+    "direction": 1,
+    "value": 1.0,
+    "use_averaged_flow": true
+   },
+   "boundary_conditions": [
+    {
+     "type": "no_slip",
+     "zone_indices": [
+      3,
+      4
+     ]
+    }
+   ],
+   "source_terms": [
+    {
+     "type": "boussinesq",
+     "scalar_field": "s",
+     "g": [
+      0.0,
+      -1.0,
+      0.0
+     ],
+     "reference_value": 0.5,
+     "beta": 0.5
+    }
+   ],
+   "output_control": "tsteps",
+   "output_value": 20
+  },
+  "scalar": {
+   "enabled": true,
+   "name": "s",
+   "Pe": 100.0,
+   "initial_condition": {
+    "type": "expression",
+    "value": "1 - y/2 + 0.05*y*(2 - y)*sin(x)*cos(z)"
+   },
+   "solver": {
+    "type": "cg",
+    "preconditioner": {
+     "type": "jacobi"
+    },
+    "projection_space_size": 0,
+    "absolute_tolerance": 1e-12,
+    "max_iterations": 2000
+   },
+   "boundary_conditions": [
+    {
+     "type": "dirichlet",
+     "value": 1.0,
+     "zone_indices": [
+      3
+     ]
+    },
+    {
+     "type": "dirichlet",
+     "value": 0.0,
+     "zone_indices": [
+      4
+     ]
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,78 @@
+{
+  "version": 1.0,
+  "case": {
+    "mesh_file": "2d_cylinder.nmsh",
+    "output_checkpoints": false,
+    "output_at_end": false,
+    "time": {
+      "end_time": 0.2,
+      "variable_timestep": false,
+      "timestep": 0.002
+    },
+    "numerics": {
+      "time_order": 3,
+      "polynomial_order": 7,
+      "dealias": true
+    },
+    "fluid": {
+      "scheme": "pnpn",
+      "Re": 160.0,
+      "initial_condition": {
+        "type": "uniform",
+        "value": [
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      "velocity_solver": {
+        "type": "quasi2d",
+        "preconditioner": {
+          "type": "quasi2d",
+          "skip_tol": 1e-06
+        },
+        "projection_space_size": 0,
+        "absolute_tolerance": 1e-07,
+        "max_iterations": 50
+      },
+      "pressure_solver": {
+        "type": "quasi2d",
+        "preconditioner": {
+          "type": "quasi2d",
+          "skip_tol": 1e-06
+        },
+        "projection_space_size": 0,
+        "absolute_tolerance": 1e-07,
+        "max_iterations": 20
+      },
+      "boundary_conditions": [
+        {
+          "type": "no_slip",
+          "zone_indices": [
+            2
+          ]
+        },
+        {
+          "type": "velocity_value",
+          "zone_indices": [
+            3
+          ],
+          "value": [
+            1.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "type": "outflow",
+          "zone_indices": [
+            4
+          ]
+        }
+      ],
+      "output_control": "never",
+      "output_value": 1.0
+    },
+    "output_precision": "double"
+  }
+}
